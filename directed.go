@@ -1,27 +1,21 @@
 package graph
 
 import (
+	"errors"
 	"fmt"
-	"math"
 )
 
 type directed[K comparable, T any] struct {
-	hash     Hash[K, T]
-	traits   *Traits
-	vertices map[K]T
-	edges    map[K]map[K]Edge[T]
-	outEdges map[K]map[K]Edge[T]
-	inEdges  map[K]map[K]Edge[T]
+	hash   Hash[K, T]
+	traits *Traits
+	store  Store[K, T]
 }
 
-func newDirected[K comparable, T any](hash Hash[K, T], traits *Traits) *directed[K, T] {
+func newDirected[K comparable, T any](hash Hash[K, T], traits *Traits, store Store[K, T]) *directed[K, T] {
 	return &directed[K, T]{
-		hash:     hash,
-		traits:   traits,
-		vertices: make(map[K]T),
-		edges:    make(map[K]map[K]Edge[T]),
-		outEdges: make(map[K]map[K]Edge[T]),
-		inEdges:  make(map[K]map[K]Edge[T]),
+		hash:   hash,
+		traits: traits,
+		store:  store,
 	}
 }
 
@@ -29,47 +23,87 @@ func (d *directed[K, T]) Traits() *Traits {
 	return d.traits
 }
 
-func (d *directed[K, T]) Vertex(value T) {
+func (d *directed[K, T]) AddVertex(value T, options ...func(*VertexProperties)) error {
 	hash := d.hash(value)
-	d.vertices[hash] = value
+	properties := VertexProperties{
+		Weight:     0,
+		Attributes: make(map[string]string),
+	}
+
+	for _, option := range options {
+		option(&properties)
+	}
+
+	return d.store.AddVertex(hash, value, properties)
 }
 
-func (d *directed[K, T]) Edge(source, target T, options ...func(*EdgeProperties)) error {
-	sourceHash := d.hash(source)
-	targetHash := d.hash(target)
-
-	return d.EdgeByHashes(sourceHash, targetHash, options...)
-}
-
-func (d *directed[K, T]) EdgeByHashes(sourceHash, targetHash K, options ...func(*EdgeProperties)) error {
-	source, ok := d.vertices[sourceHash]
-	if !ok {
-		return fmt.Errorf("could not find source vertex with hash %v", sourceHash)
+func (d *directed[K, T]) AddVerticesFrom(g Graph[K, T]) error {
+	adjacencyMap, err := g.AdjacencyMap()
+	if err != nil {
+		return fmt.Errorf("failed to get adjacency map: %w", err)
 	}
 
-	target, ok := d.vertices[targetHash]
-	if !ok {
-		return fmt.Errorf("could not find target vertex with hash %v", targetHash)
-	}
-
-	if _, ok := d.GetEdgeByHashes(sourceHash, targetHash); ok {
-		return fmt.Errorf("an edge between vertices %v and %v already exists", sourceHash, targetHash)
-	}
-
-	// If the graph was declared to be acyclic, permit the creation of a cycle.
-	if d.traits.IsAcyclic {
-		createsCycle, err := d.CreatesCycleByHashes(sourceHash, targetHash)
+	for hash := range adjacencyMap {
+		vertex, properties, err := g.VertexWithProperties(hash)
 		if err != nil {
-			return fmt.Errorf("failed to check for cycles: %w", err)
+			return fmt.Errorf("failed to get vertex %v: %w", hash, err)
+		}
+
+		if err = d.AddVertex(vertex, copyVertexProperties(properties)); err != nil {
+			return fmt.Errorf("failed to add vertex %v: %w", hash, err)
+		}
+	}
+
+	return nil
+}
+
+func (d *directed[K, T]) Vertex(hash K) (T, error) {
+	vertex, _, err := d.store.Vertex(hash)
+	return vertex, err
+}
+
+func (d *directed[K, T]) VertexWithProperties(hash K) (T, VertexProperties, error) {
+	vertex, properties, err := d.store.Vertex(hash)
+	if err != nil {
+		return vertex, VertexProperties{}, err
+	}
+
+	return vertex, properties, nil
+}
+
+func (d *directed[K, T]) RemoveVertex(hash K) error {
+	return d.store.RemoveVertex(hash)
+}
+
+func (d *directed[K, T]) AddEdge(sourceHash, targetHash K, options ...func(*EdgeProperties)) error {
+	_, _, err := d.store.Vertex(sourceHash)
+	if err != nil {
+		return fmt.Errorf("source vertex %v: %w", sourceHash, err)
+	}
+
+	_, _, err = d.store.Vertex(targetHash)
+	if err != nil {
+		return fmt.Errorf("target vertex %v: %w", targetHash, err)
+	}
+
+	if _, err := d.Edge(sourceHash, targetHash); !errors.Is(err, ErrEdgeNotFound) {
+		return ErrEdgeAlreadyExists
+	}
+
+	// If the user opted in to preventing cycles, run a cycle check.
+	if d.traits.PreventCycles {
+		createsCycle, err := d.createsCycle(sourceHash, targetHash)
+		if err != nil {
+			return fmt.Errorf("check for cycles: %w", err)
 		}
 		if createsCycle {
-			return fmt.Errorf("an edge between %v and %v would introduce a cycle", sourceHash, targetHash)
+			return ErrEdgeCreatesCycle
 		}
 	}
 
-	edge := Edge[T]{
-		Source: source,
-		Target: target,
+	edge := Edge[K]{
+		Source: sourceHash,
+		Target: targetHash,
 		Properties: EdgeProperties{
 			Attributes: make(map[string]string),
 		},
@@ -79,352 +113,167 @@ func (d *directed[K, T]) EdgeByHashes(sourceHash, targetHash K, options ...func(
 		option(&edge.Properties)
 	}
 
-	d.addEdge(sourceHash, targetHash, edge)
-
-	return nil
+	return d.addEdge(sourceHash, targetHash, edge)
 }
 
-func (d *directed[K, T]) GetEdge(source, target T) (Edge[T], bool) {
-	sourceHash := d.hash(source)
-	targetHash := d.hash(target)
-
-	return d.GetEdgeByHashes(sourceHash, targetHash)
-}
-
-func (d *directed[K, T]) GetEdgeByHashes(sourceHash, targetHash K) (Edge[T], bool) {
-	sourceEdges, ok := d.edges[sourceHash]
-	if !ok {
-		return Edge[T]{}, false
+func (d *directed[K, T]) AddEdgesFrom(g Graph[K, T]) error {
+	edges, err := g.Edges()
+	if err != nil {
+		return fmt.Errorf("failed to get edges: %w", err)
 	}
 
-	if edge, ok := sourceEdges[targetHash]; ok {
-		return edge, true
-	}
-
-	return Edge[T]{}, false
-}
-
-func (d *directed[K, T]) DFS(start T, visit func(value T) bool) error {
-	startHash := d.hash(start)
-
-	return d.DFSByHash(startHash, visit)
-}
-
-func (d *directed[K, T]) DFSByHash(startHash K, visit func(value T) bool) error {
-	if _, ok := d.vertices[startHash]; !ok {
-		return fmt.Errorf("could not find start vertex with hash %v", startHash)
-	}
-
-	stack := make([]K, 0)
-	visited := make(map[K]bool)
-
-	stack = append(stack, startHash)
-
-	for len(stack) > 0 {
-		currentHash := stack[len(stack)-1]
-		currentVertex := d.vertices[currentHash]
-
-		stack = stack[:len(stack)-1]
-
-		if _, ok := visited[currentHash]; !ok {
-			// Stop traversing the graph if the visit function returns true.
-			if visit(currentVertex) {
-				break
-			}
-			visited[currentHash] = true
-
-			for adjacency := range d.outEdges[currentHash] {
-				stack = append(stack, adjacency)
-			}
+	for _, edge := range edges {
+		if err := d.AddEdge(copyEdge(edge)); err != nil {
+			return fmt.Errorf("failed to add (%v, %v): %w", edge.Source, edge.Target, err)
 		}
 	}
 
 	return nil
 }
 
-func (d *directed[K, T]) BFS(start T, visit func(value T) bool) error {
-	startHash := d.hash(start)
-
-	return d.BFSByHash(startHash, visit)
-}
-
-func (d *directed[K, T]) BFSByHash(startHash K, visit func(value T) bool) error {
-	if _, ok := d.vertices[startHash]; !ok {
-		return fmt.Errorf("could not find start vertex with hash %v", startHash)
+func (d *directed[K, T]) Edge(sourceHash, targetHash K) (Edge[T], error) {
+	edge, err := d.store.Edge(sourceHash, targetHash)
+	if err != nil {
+		return Edge[T]{}, err
 	}
 
-	queue := make([]K, 0)
-	visited := make(map[K]bool)
+	sourceVertex, _, err := d.store.Vertex(sourceHash)
+	if err != nil {
+		return Edge[T]{}, err
+	}
 
-	visited[startHash] = true
-	queue = append(queue, startHash)
+	targetVertex, _, err := d.store.Vertex(targetHash)
+	if err != nil {
+		return Edge[T]{}, err
+	}
 
-	for len(queue) > 0 {
-		currentHash := queue[0]
-		currentVertex := d.vertices[currentHash]
+	return Edge[T]{
+		Source: sourceVertex,
+		Target: targetVertex,
+		Properties: EdgeProperties{
+			Weight:     edge.Properties.Weight,
+			Attributes: edge.Properties.Attributes,
+			Data:       edge.Properties.Data,
+		},
+	}, nil
+}
 
-		queue = queue[1:]
+func (d *directed[K, T]) Edges() ([]Edge[K], error) {
+	return d.store.ListEdges()
+}
 
-		// Stop traversing the graph if the visit function returns true.
-		if visit(currentVertex) {
-			break
-		}
+func (d *directed[K, T]) UpdateEdge(source, target K, options ...func(properties *EdgeProperties)) error {
+	existingEdge, err := d.store.Edge(source, target)
+	if err != nil {
+		return err
+	}
 
-		for adjacency := range d.outEdges[currentHash] {
-			if _, ok := visited[adjacency]; !ok {
-				visited[adjacency] = true
-				queue = append(queue, adjacency)
-			}
-		}
+	for _, option := range options {
+		option(&existingEdge.Properties)
+	}
 
+	return d.store.UpdateEdge(source, target, existingEdge)
+}
+
+func (d *directed[K, T]) RemoveEdge(source, target K) error {
+	if _, err := d.Edge(source, target); err != nil {
+		return err
+	}
+
+	if err := d.store.RemoveEdge(source, target); err != nil {
+		return fmt.Errorf("failed to remove edge from %v to %v: %w", source, target, err)
 	}
 
 	return nil
 }
 
-func (d *directed[K, T]) CreatesCycle(source, target T) (bool, error) {
-	sourceHash := d.hash(source)
-	targetHash := d.hash(target)
+func (d *directed[K, T]) AdjacencyMap() (map[K]map[K]Edge[K], error) {
+	vertices, err := d.store.ListVertices()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list vertices: %w", err)
+	}
 
-	return d.CreatesCycleByHashes(sourceHash, targetHash)
+	edges, err := d.store.ListEdges()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list edges: %w", err)
+	}
+
+	m := make(map[K]map[K]Edge[K], len(vertices))
+
+	for _, vertex := range vertices {
+		m[vertex] = make(map[K]Edge[K])
+	}
+
+	for _, edge := range edges {
+		m[edge.Source][edge.Target] = edge
+	}
+
+	return m, nil
 }
 
-func (d *directed[K, T]) CreatesCycleByHashes(sourceHash, targetHash K) (bool, error) {
-	source, ok := d.vertices[sourceHash]
-	if !ok {
-		return false, fmt.Errorf("could not find source vertex with hash %v", source)
+func (d *directed[K, T]) PredecessorMap() (map[K]map[K]Edge[K], error) {
+	vertices, err := d.store.ListVertices()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list vertices: %w", err)
 	}
 
-	_, ok = d.vertices[targetHash]
-	if !ok {
-		return false, fmt.Errorf("could not find target vertex with hash %v", source)
+	edges, err := d.store.ListEdges()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list edges: %w", err)
 	}
 
-	if sourceHash == targetHash {
-		return true, nil
+	m := make(map[K]map[K]Edge[K], len(vertices))
+
+	for _, vertex := range vertices {
+		m[vertex] = make(map[K]Edge[K])
 	}
 
-	stack := make([]K, 0)
-	visited := make(map[K]bool)
-
-	stack = append(stack, sourceHash)
-
-	for len(stack) > 0 {
-		currentHash := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if _, ok := visited[currentHash]; !ok {
-			// If the current vertex, e.g. a predecessor of the source vertex, also is the target
-			// vertex, an edge between these two would create a cycle.
-			if currentHash == targetHash {
-				return true, nil
-			}
-			visited[currentHash] = true
-
-			for _, predecessor := range d.predecessors(currentHash) {
-				stack = append(stack, predecessor)
-			}
+	for _, edge := range edges {
+		if _, ok := m[edge.Target]; !ok {
+			m[edge.Target] = make(map[K]Edge[K])
 		}
+		m[edge.Target][edge.Source] = edge
 	}
 
-	return false, nil
+	return m, nil
 }
 
-func (d *directed[K, T]) Degree(vertex T) (int, error) {
-	sourceHash := d.hash(vertex)
-
-	return d.DegreeByHash(sourceHash)
+func (d *directed[K, T]) addEdge(sourceHash, targetHash K, edge Edge[K]) error {
+	return d.store.AddEdge(sourceHash, targetHash, edge)
 }
 
-func (d *directed[K, T]) DegreeByHash(vertexHash K) (int, error) {
-	if _, ok := d.vertices[vertexHash]; !ok {
-		return 0, fmt.Errorf("could not find vertex with hash %v", vertexHash)
+func (d *directed[K, T]) Clone() (Graph[K, T], error) {
+	traits := &Traits{
+		IsDirected:    d.traits.IsDirected,
+		IsAcyclic:     d.traits.IsAcyclic,
+		IsWeighted:    d.traits.IsWeighted,
+		IsRooted:      d.traits.IsRooted,
+		PreventCycles: d.traits.PreventCycles,
 	}
 
-	degree := 0
-
-	if inEdges, ok := d.inEdges[vertexHash]; ok {
-		degree += len(inEdges)
-	}
-	if outEdges, ok := d.outEdges[vertexHash]; ok {
-		degree += len(outEdges)
+	clone := &directed[K, T]{
+		hash:   d.hash,
+		traits: traits,
+		store:  newMemoryStore[K, T](),
 	}
 
-	return degree, nil
+	if err := clone.AddVerticesFrom(d); err != nil {
+		return nil, fmt.Errorf("failed to add vertices: %w", err)
+	}
+
+	if err := clone.AddEdgesFrom(d); err != nil {
+		return nil, fmt.Errorf("failed to add edges: %w", err)
+	}
+
+	return clone, nil
 }
 
-type sccState[K comparable] struct {
-	components [][]K
-	stack      []K
-	onStack    map[K]bool
-	visited    map[K]bool
-	lowlink    map[K]int
-	index      map[K]int
-	time       int
+func (d *directed[K, T]) Order() (int, error) {
+	return d.store.VertexCount()
 }
 
-// StronglyConnectedComponents searches strongly connected components within the graph, and returns
-// the hashes of the vertices shaping these components. The current implementation of this function
-// uses Tarjan's algorithm and runs recursively.
-func (d *directed[K, T]) StronglyConnectedComponents() ([][]K, error) {
-
-	state := &sccState[K]{
-		components: make([][]K, 0),
-		stack:      make([]K, 0),
-		onStack:    make(map[K]bool),
-		visited:    make(map[K]bool),
-		lowlink:    make(map[K]int),
-		index:      make(map[K]int),
-	}
-
-	for hash := range d.vertices {
-		if ok, _ := state.visited[hash]; !ok {
-			d.findSCC(hash, state)
-		}
-	}
-
-	return state.components, nil
-}
-
-func (d *directed[K, T]) findSCC(vertexHash K, state *sccState[K]) {
-	state.stack = append(state.stack, vertexHash)
-	state.onStack[vertexHash] = true
-	state.visited[vertexHash] = true
-	state.index[vertexHash] = state.time
-	state.lowlink[vertexHash] = state.time
-
-	state.time++
-
-	for adjancency := range d.outEdges[vertexHash] {
-		if ok, _ := state.visited[adjancency]; !ok {
-			d.findSCC(adjancency, state)
-
-			smallestLowlink := math.Min(
-				float64(state.lowlink[vertexHash]),
-				float64(state.lowlink[adjancency]),
-			)
-			state.lowlink[vertexHash] = int(smallestLowlink)
-		} else {
-			// If the adjacent vertex already is on the stack, the edge joining the current and the
-			// adjacent vertex is a back edge. Therefore, update the vertex' lowlink value to the
-			// index of the adjacent vertex if it is smaller than the lowlink value.
-			if ok, _ := state.onStack[adjancency]; ok {
-				smallestLowlink := math.Min(
-					float64(state.lowlink[vertexHash]),
-					float64(state.index[adjancency]),
-				)
-				state.lowlink[vertexHash] = int(smallestLowlink)
-			}
-		}
-	}
-
-	// If the lowlink value of the vertex is equal to its DFS index, this is th head vertex of a
-	// strongly connected component, shaped by this vertex and the vertices on the stack.
-	if state.lowlink[vertexHash] == state.index[vertexHash] {
-		var hash K
-		var component []K
-
-		for hash != vertexHash {
-			hash = state.stack[len(state.stack)-1]
-			state.stack = state.stack[:len(state.stack)-1]
-			state.onStack[hash] = false
-
-			component = append(component, hash)
-		}
-
-		state.components = append(state.components, component)
-	}
-}
-
-// ShortestPath computes the shortest path between two vertices and returns the hashes of the
-// vertices forming that path. The current implementation uses Dijkstra with a priority queue.
-func (d *directed[K, T]) ShortestPath(source, target T) ([]K, error) {
-	sourceHash := d.hash(source)
-	targetHash := d.hash(target)
-
-	return d.ShortestPathByHashes(sourceHash, targetHash)
-}
-
-func (d *directed[K, T]) ShortestPathByHashes(sourceHash, targetHash K) ([]K, error) {
-	weights := make(map[K]float64)
-	visited := make(map[K]bool)
-	predecessors := make(map[K]K)
-
-	weights[sourceHash] = 0
-	visited[sourceHash] = true
-
-	queue := newPriorityQueue[K]()
-
-	for hash := range d.vertices {
-		if hash != sourceHash {
-			weights[hash] = math.Inf(1)
-			visited[hash] = false
-		}
-
-		queue.Push(hash, weights[hash])
-	}
-
-	for queue.Len() > 0 {
-		vertex, _ := queue.Pop()
-		hasInfiniteWeight := math.IsInf(float64(weights[vertex]), 1)
-
-		if vertex == targetHash {
-			if _, ok := d.inEdges[vertex]; !ok {
-				return nil, fmt.Errorf("vertex %v is not reachable from vertex %v", targetHash, sourceHash)
-			}
-		}
-
-		outEdges, ok := d.outEdges[vertex]
-		if !ok {
-			continue
-		}
-
-		for successor, edge := range outEdges {
-			weight := weights[vertex] + float64(edge.Properties.Weight)
-
-			if weight < weights[successor] && !hasInfiniteWeight {
-				weights[successor] = weight
-				predecessors[successor] = vertex
-				queue.DecreasePriority(successor, weight)
-			}
-		}
-	}
-
-	// Backtrack the predecessors from target to source. These are the least-weighted edges.
-	path := []K{targetHash}
-	hashCursor := targetHash
-
-	for hashCursor != sourceHash {
-		hashCursor = predecessors[hashCursor]
-		path = append([]K{hashCursor}, path...)
-	}
-
-	return path, nil
-}
-
-func (d *directed[K, T]) AdjacencyMap() map[K]map[K]Edge[K] {
-	adjacencyMap := make(map[K]map[K]Edge[K])
-
-	// Create an entry for each vertex to guarantee that all vertices are contained and its
-	// adjacencies can be safely accessed without a preceding check.
-	for vertexHash := range d.vertices {
-		adjacencyMap[vertexHash] = make(map[K]Edge[K])
-	}
-
-	for vertexHash, outEdges := range d.outEdges {
-		for adjacencyHash, edge := range outEdges {
-			adjacencyMap[vertexHash][adjacencyHash] = Edge[K]{
-				Source: vertexHash,
-				Target: adjacencyHash,
-				Properties: EdgeProperties{
-					Weight:     edge.Properties.Weight,
-					Attributes: edge.Properties.Attributes,
-				},
-			}
-		}
-	}
-
-	return adjacencyMap
+func (d *directed[K, T]) Size() (int, error) {
+	return d.store.EdgeCount()
 }
 
 func (d *directed[K, T]) edgesAreEqual(a, b Edge[T]) bool {
@@ -436,37 +285,31 @@ func (d *directed[K, T]) edgesAreEqual(a, b Edge[T]) bool {
 	return aSourceHash == bSourceHash && aTargetHash == bTargetHash
 }
 
-func (d *directed[K, T]) addEdge(sourceHash, targetHash K, edge Edge[T]) {
-	if _, ok := d.edges[sourceHash]; !ok {
-		d.edges[sourceHash] = make(map[K]Edge[T])
+func (d *directed[K, T]) createsCycle(source, target K) (bool, error) {
+	// If the underlying store implements CreatesCycle, use that fast path.
+	if cc, ok := d.store.(interface {
+		CreatesCycle(source, target K) (bool, error)
+	}); ok {
+		return cc.CreatesCycle(source, target)
 	}
 
-	d.edges[sourceHash][targetHash] = edge
-
-	if _, ok := d.outEdges[sourceHash]; !ok {
-		d.outEdges[sourceHash] = make(map[K]Edge[T])
-	}
-
-	d.outEdges[sourceHash][targetHash] = edge
-
-	if _, ok := d.inEdges[targetHash]; !ok {
-		d.inEdges[targetHash] = make(map[K]Edge[T])
-	}
-
-	d.inEdges[targetHash][sourceHash] = edge
+	// Slow path.
+	return CreatesCycle(Graph[K, T](d), source, target)
 }
 
-func (d *directed[K, T]) predecessors(vertexHash K) []K {
-	var predecessorHashes []K
-
-	inEdges, ok := d.inEdges[vertexHash]
-	if !ok {
-		return predecessorHashes
+// copyEdge returns an argument list suitable for the Graph.AddEdge method. This
+// argument list is derived from the given edge, hence the name copyEdge.
+//
+// The last argument is a custom functional option that sets the edge properties
+// to the properties of the original edge.
+func copyEdge[K comparable](edge Edge[K]) (K, K, func(properties *EdgeProperties)) {
+	copyProperties := func(p *EdgeProperties) {
+		for k, v := range edge.Properties.Attributes {
+			p.Attributes[k] = v
+		}
+		p.Weight = edge.Properties.Weight
+		p.Data = edge.Properties.Data
 	}
 
-	for hash := range inEdges {
-		predecessorHashes = append(predecessorHashes, hash)
-	}
-
-	return predecessorHashes
+	return edge.Source, edge.Target, copyProperties
 }

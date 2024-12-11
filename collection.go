@@ -1,94 +1,197 @@
 package graph
 
 import (
+	"container/heap"
 	"errors"
-	"sort"
 )
 
-// priorityQueue is a priority queue implementation for minimum priorities, meaning that smaller
-// values will be prioritized. It maintains an descendently ordered list of priority items.
-//
-// This is still a naive implementation, which is to be replaced with a binary heap implementation.
+// priorityQueue implements a minimum priority queue using a minimum binary heap
+// that prioritizes smaller values over larger values.
 type priorityQueue[T comparable] struct {
-	items []priorityItem[T]
+	items *minHeap[T]
+	cache map[T]*priorityItem[T]
 }
 
-// priorityItem is an item in the priority queue, consiting of a priority and an actual value.
+// priorityItem is an item on the binary heap consisting of a priority value and
+// an actual payload value.
 type priorityItem[T comparable] struct {
 	value    T
 	priority float64
+	index    int
 }
 
 func newPriorityQueue[T comparable]() *priorityQueue[T] {
 	return &priorityQueue[T]{
-		items: make([]priorityItem[T], 0),
+		items: &minHeap[T]{},
+		cache: map[T]*priorityItem[T]{},
 	}
 }
 
-// Push pushes a new item with the given priority into the queue. Because Push keeps track of the
-// descendant order of items and priorities, it has O(n) insertion time.
-func (p *priorityQueue[T]) Push(item T, priority float64) {
-	index := p.Len() - 1
-
-	for i := p.Len(); i > 0; i-- {
-		currentItem := p.items[i-1]
-		if currentItem.priority > priority {
-			index = i
-			break
-		}
-	}
-
-	p.insertItemAt(item, priority, index)
-}
-
-// Pop returns the item with the smallest priority from the queue and removes that item. Returns an
-// error if the priority queue is empty, which can be tested using Len first.s
-func (p *priorityQueue[T]) Pop() (T, error) {
-	var priorityItem priorityItem[T]
-
-	if p.Len() == 0 {
-		return priorityItem.value, errors.New("priority queue is empty")
-	}
-
-	priorityItem = p.items[p.Len()-1]
-	p.items = p.items[:p.Len()-1]
-
-	return priorityItem.value, nil
-}
-
-// DecreasePriority decreases the priority of a given item to the given priority. The item must be
-// pushed into the queue first. If the item doesn't exist, nothing happens.
-//
-// With the current implementation, DecreasePriority causes the items in the queue to be re-sorted.
-func (p *priorityQueue[T]) DecreasePriority(item T, priority float64) {
-	for i, currentItem := range p.items {
-		if currentItem.value == item {
-			p.items[i].priority = priority
-		}
-	}
-
-	sort.Slice(p.items, func(i, j int) bool {
-		return p.items[i].priority > p.items[j].priority
-	})
-}
-
-// Len returns the current length of the priority queue, i.e. the number of items in the queue.
+// Len returns the total number of items in the priority queue.
 func (p *priorityQueue[T]) Len() int {
-	return len(p.items)
+	return p.items.Len()
 }
 
-func (p *priorityQueue[T]) insertItemAt(item T, priority float64, index int) {
-	priorityItem := priorityItem[T]{
-		value:    item,
-		priority: priority,
-	}
-
-	if p.Len() == 0 || p.Len() == index {
-		p.items = append(p.items, priorityItem)
+// Push pushes a new item with the given priority into the queue. This operation
+// may cause a re-balance of the heap and thus scales with O(log n).
+func (p *priorityQueue[T]) Push(item T, priority float64) {
+	if _, ok := p.cache[item]; ok {
 		return
 	}
 
-	p.items = append(p.items[:index+1], p.items[index:]...)
+	newItem := &priorityItem[T]{
+		value:    item,
+		priority: priority,
+		index:    0,
+	}
 
-	p.items[index] = priorityItem
+	heap.Push(p.items, newItem)
+	p.cache[item] = newItem
+}
+
+// Pop returns and removes the item with the lowest priority. This operation may
+// cause a re-balance of the heap and thus scales with O(log n).
+func (p *priorityQueue[T]) Pop() (T, error) {
+	if len(*p.items) == 0 {
+		var empty T
+		return empty, errors.New("priority queue is empty")
+	}
+
+	item := heap.Pop(p.items).(*priorityItem[T])
+	delete(p.cache, item.value)
+
+	return item.value, nil
+}
+
+// UpdatePriority updates the priority of a given item and sets it to the given
+// priority. If the item doesn't exist, nothing happens. This operation may
+// cause a re-balance of the heap and this scales with O(log n).
+func (p *priorityQueue[T]) UpdatePriority(item T, priority float64) {
+	targetItem, ok := p.cache[item]
+	if !ok {
+		return
+	}
+
+	targetItem.priority = priority
+	heap.Fix(p.items, targetItem.index)
+}
+
+// minHeap is a minimum binary heap that implements heap.Interface.
+type minHeap[T comparable] []*priorityItem[T]
+
+func (m *minHeap[T]) Len() int {
+	return len(*m)
+}
+
+func (m *minHeap[T]) Less(i, j int) bool {
+	return (*m)[i].priority < (*m)[j].priority
+}
+
+func (m *minHeap[T]) Swap(i, j int) {
+	(*m)[i], (*m)[j] = (*m)[j], (*m)[i]
+	(*m)[i].index = i
+	(*m)[j].index = j
+}
+
+func (m *minHeap[T]) Push(item interface{}) {
+	i := item.(*priorityItem[T])
+	i.index = len(*m)
+	*m = append(*m, i)
+}
+
+func (m *minHeap[T]) Pop() interface{} {
+	old := *m
+	item := old[len(old)-1]
+	*m = old[:len(old)-1]
+
+	return item
+}
+
+type stack[T comparable] struct {
+	elements []T
+	registry map[T]struct{}
+}
+
+func newStack[T comparable]() *stack[T] {
+	return &stack[T]{
+		elements: make([]T, 0),
+		registry: make(map[T]struct{}),
+	}
+}
+
+func (s *stack[T]) push(t T) {
+	s.elements = append(s.elements, t)
+	s.registry[t] = struct{}{}
+}
+
+func (s *stack[T]) pop() (T, bool) {
+	element, ok := s.top()
+	if !ok {
+		return element, false
+	}
+
+	s.elements = s.elements[:len(s.elements)-1]
+	delete(s.registry, element)
+
+	return element, true
+}
+
+func (s *stack[T]) top() (T, bool) {
+	if s.isEmpty() {
+		var defaultValue T
+		return defaultValue, false
+	}
+
+	return s.elements[len(s.elements)-1], true
+}
+
+func (s *stack[T]) isEmpty() bool {
+	return len(s.elements) == 0
+}
+
+func (s *stack[T]) forEach(f func(T)) {
+	for _, e := range s.elements {
+		f(e)
+	}
+}
+
+func (s *stack[T]) contains(element T) bool {
+	_, ok := s.registry[element]
+	return ok
+}
+
+type stackOfStacks[T comparable] struct {
+	stacks []*stack[T]
+}
+
+func newStackOfStacks[T comparable]() *stackOfStacks[T] {
+	return &stackOfStacks[T]{
+		stacks: make([]*stack[T], 0),
+	}
+}
+
+func (s *stackOfStacks[T]) push(stack *stack[T]) {
+	s.stacks = append(s.stacks, stack)
+}
+
+func (s *stackOfStacks[T]) pop() (*stack[T], error) {
+	e, err := s.top()
+	if err != nil {
+		return &stack[T]{}, err
+	}
+
+	s.stacks = s.stacks[:len(s.stacks)-1]
+	return e, nil
+}
+
+func (s *stackOfStacks[T]) top() (*stack[T], error) {
+	if s.isEmpty() {
+		return &stack[T]{}, errors.New("no element in stack")
+	}
+
+	return s.stacks[len(s.stacks)-1], nil
+}
+
+func (s *stackOfStacks[T]) isEmpty() bool {
+	return len(s.stacks) == 0
 }

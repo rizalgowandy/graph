@@ -113,9 +113,33 @@ func TestTree(t *testing.T) {
 	}
 }
 
+func TestPreventCycles(t *testing.T) {
+	tests := map[string]struct {
+		expected *Traits
+	}{
+		"prevent cycles": {
+			expected: &Traits{
+				IsAcyclic:     true,
+				PreventCycles: true,
+			},
+		},
+	}
+
+	for name, test := range tests {
+		p := &Traits{}
+
+		PreventCycles()(p)
+
+		if !traitsAreEqual(test.expected, p) {
+			t.Errorf("%s: trait expectation doesn't match: expected %v, got %v", name, test.expected, p)
+		}
+	}
+}
+
 func traitsAreEqual(a, b *Traits) bool {
 	return a.IsAcyclic == b.IsAcyclic &&
 		a.IsDirected == b.IsDirected &&
 		a.IsRooted == b.IsRooted &&
-		a.IsWeighted == b.IsWeighted
+		a.IsWeighted == b.IsWeighted &&
+		a.PreventCycles == b.PreventCycles
 }
